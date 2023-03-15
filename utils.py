@@ -3,7 +3,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 import pandas as pd
 import numpy as np
-#import pandas_profiling 
+import random
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
@@ -16,6 +16,7 @@ import itertools
 from sklearn import metrics
 from sklearn.cluster import KMeans
 from sklearn.neighbors import KNeighborsClassifier
+
 
 def load_taobao_df():
     ad = "/datasets/taobao/ad_feature.csv"
@@ -295,3 +296,18 @@ def fit(server_model, client_model,loss_fn, trainloader, testloader, epochs, dev
         print(f'saving for epoch {e}')
         torch.save(server_model, 'model/server_model.pt')
         torch.save(client_model, 'model/client_model.pt')
+
+def label_dp(label, prob):
+    size = len(label)
+    flipping = [random.random() > prob for _ in range(size)]
+    new_label = torch.tensor([x+y-2*x*y for x,y in zip(label, flipping)])
+    return new_label.unsqueeze(1).to(torch.float32), flipping
+
+def dp(dx, clip, noise):
+    # first need to clip
+    norm = torch.norm(dx, p=2)
+    dx_clip = dx / max(1, norm/clip)
+    #x = x + (0.1**0.5)*torch.randn(5, 10, 20)
+    dx_noise = dx_clip + torch.normal(mean = 0, std = clip* noise, size = dx.size()) # need to check
+
+    return dx_noise, norm
