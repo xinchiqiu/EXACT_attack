@@ -1,10 +1,9 @@
 from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
+#from sklearn.model_selection import StratifiedKFold
+#from sklearn.preprocessing import LabelEncoder
 import pandas as pd
 import numpy as np
 import random
-from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import torch
@@ -14,9 +13,10 @@ import torch.nn.functional as F
 from torchvision import models
 import itertools
 from sklearn import metrics
-from sklearn.cluster import KMeans
-from sklearn.neighbors import KNeighborsClassifier
+#from sklearn.cluster import KMeans
+#from sklearn.neighbors import KNeighborsClassifier
 
+from DeepCTR.deepctr_torch.inputs import (DenseFeat, SparseFeat, VarLenSparseFeat, get_feature_names)
 
 def load_taobao_df():
     ad = "/datasets/taobao/ad_feature.csv"
@@ -70,7 +70,10 @@ def load_taobao_df():
     # combine 3 tables
     df1 = raw_sample_df_new.merge(optimized_g3, on="userid")
     final_df = df1.merge(optimized_g2, on="adgroup_id")
-
+    
+    # make it faster, need to remove
+    #final_df = final_df[:300000]
+    
     final_df['pvalue_level'] = final_df['pvalue_level'].fillna(2, )
     final_df['final_gender_code'] = final_df['final_gender_code'].fillna(1, )
     final_df['age_level'] = final_df['age_level'].fillna(3, )
@@ -79,6 +82,7 @@ def load_taobao_df():
     final_df['brand'] = final_df['brand'].fillna(0, )
     final_df['customer'] = final_df['customer'].fillna(0, )
     final_df['cms_group_id'] = final_df['cms_group_id'].fillna(13, )
+
 
     final_df['pvalue_level'] -= 1
     final_df['shopping_level'] -= 1
@@ -95,8 +99,54 @@ def load_taobao_df():
                                 'customer':int,
                                 'brand':int}
                                 )
+    
+    #sparse_features = ['adgroup_id','cate_id','customer','brand','cms_segid', 'final_gender_code','userid'] # for non_split
+    #sparse_features = ['adgroup_id', 'cate_id', 'customer', 'brand', 'cms_segid', 'cms_group_id','userid'] #for non-split
+    
+    sparse_features = ['adgroup_id','cate_id','customer','brand','userid']
+    final_df[sparse_features] = final_df[sparse_features].fillna('-1', )    
+    dense_features = ['price']
+    #client_features =  ['cms_segid', 'final_gender_code','age_level','pvalue_level','shopping_level','occupation']
+    client_features =  ['age_level','pvalue_level','shopping_level','occupation']
+    target = ['clk']
+    
+    mms = MinMaxScaler(feature_range=(0, 1))
+    final_df[dense_features] = mms.fit_transform(final_df[dense_features])
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]# + [VarLenSparseFeat(SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8), 1) for feat in sequence_features] 
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    feature_names = get_feature_names(linear_feature_columns + dnn_feature_columns, )
 
-    return final_df
+    #client_feature_columns = [DenseFeat(feat, 1, )for feat in client_features]
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    client_feature_names = get_feature_names(client_feature_columns, )
+    train, test = train_test_split(final_df, test_size=0.1, random_state = 42)
+
+    #train_other, train = train_test_split(train, test_size=0.003, random_state = 42)
+    #test_other, test = train_test_split(test, test_size=0.003, random_state = 42)
+    # print(len(train))
+    #test = test[:5000]
+    #print(len(train))
+
+    train_model_input = {name:train[name] for name in feature_names}
+    test_model_input = {name:test[name] for name in feature_names}
+    train_client_input = {name:train[name] for name in client_feature_names}
+    test_client_input = {name:test[name] for name in client_feature_names}
+
+    return train_model_input,  train_client_input, train[target].values, test_model_input, test_client_input,test[target].values
+
+def get_columns():
+    #sparse_features = ['userid', 'adgroup_id', 'final_gender_code', 'cate_id']
+    #sparse_features = ['adgroup_id','cate_id','customer','brand','cms_segid', 'final_gender_code','userid'] #first try
+    sparse_features = ['adgroup_id','cate_id','customer','brand','userid']    
+    dense_features = ['price']
+    #client_features =  ['cms_segid', 'final_gender_code','age_level','pvalue_level','shopping_level','occupation']
+    client_features =  ['age_level','pvalue_level','shopping_level','occupation']
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]# + [VarLenSparseFeat(SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8), 1) for feat in sequence_features] 
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    return linear_feature_columns, dnn_feature_columns, client_feature_columns
 
 class Dataset_split(Dataset):
     def __init__(self, X, emb_cols, server_continuous_cols, non_emb_cols):
@@ -244,7 +294,7 @@ def validate_split(server_model, client_model, loss_fn, test_dataloader, device)
 
 
 # build training loop that for separate model
-def one_round_split_train(server_model, client_model, server_opt, client_opt, batch , loss_fn, class_weight):
+def one_round_split_train(server_model, client_model, server_opt, client_opt, batch , loss_fn, if_dp = False):
     # zero all optimizers
     server_opt.zero_grad()
     client_opt.zero_grad()
@@ -260,19 +310,19 @@ def one_round_split_train(server_model, client_model, server_opt, client_opt, ba
     # backward
     dw, dx = client_model.backward(server_output, client_output, label,loss_fn, update_model_grad=True)
 
-    server_output.backward(dx)
+    # adding the DP on dx
+    if if_dp:
+        dx_dp, _  = dp(dx = dx[0], clip = 0.304/2, noise = 0.0005)
+        server_output.backward(dx_dp)
+    else:
+        server_output.backward(dx)
+
     server_opt.step()
     client_opt.step()
     return loss, client_output     
 
-def fit(server_model, client_model,loss_fn, trainloader, testloader, epochs, device, class_weight, lr= 1, momentum=0):
-    #loss_fn = nn.BCELoss()
-    #server_opt = torch.optim.SGD(server_model.parameters(),lr=lr, momentum = momentum)
-    #client_opt = torch.optim.SGD(client_model.parameters(),lr=lr, momentum = momentum)
-    #server_opt = torch.optim.Adam(server_model.parameters(),lr=lr)
-    #client_opt = torch.optim.Adam(client_model.parameters(),lr=lr)
+def fit(server_model, client_model,loss_fn, trainloader, testloader, epochs, device, lr= 1, momentum=0, if_dp=False):
 
-    #batch_idx = 0
     total_loss = 0
     total = 0
     print('starting fiting')
@@ -287,27 +337,168 @@ def fit(server_model, client_model,loss_fn, trainloader, testloader, epochs, dev
             for key, value in batch.items():
                 batch[key] = batch[key].to(device)
 
-            _, output = one_round_split_train(server_model, client_model, server_opt, client_opt, batch, loss_fn, class_weight)
+            _, output = one_round_split_train(server_model, client_model, server_opt, client_opt, batch, loss_fn, if_dp)
             #total_loss += loss
             total += batch['label'].shape[0]
 
             #if batch_idx % 500 == 0:
         val_loss, val_acc = validate_split(server_model, client_model, loss_fn, testloader, device)
         print(f'saving for epoch {e}')
-        torch.save(server_model, 'model/server_model.pt')
-        torch.save(client_model, 'model/client_model.pt')
+        server_f = 'model/server_model_'+str(e)+'.pt'
+        client_f = 'model/client_model_'+str(e)+'.pt'
+        torch.save(server_model, server_f)
+        torch.save(client_model, client_f)
 
 def label_dp(label, prob):
     size = len(label)
-    flipping = [random.random() > prob for _ in range(size)]
+    flipping = [random.random() < prob for _ in range(size)]
     new_label = torch.tensor([x+y-2*x*y for x,y in zip(label, flipping)])
     return new_label.unsqueeze(1).to(torch.float32), flipping
 
-def dp(dx, clip, noise):
+def dp(dx, clip, noise, device):
     # first need to clip
     norm = torch.norm(dx, p=2)
     dx_clip = dx / max(1, norm/clip)
-    #x = x + (0.1**0.5)*torch.randn(5, 10, 20)
-    dx_noise = dx_clip + torch.normal(mean = 0, std = clip* noise, size = dx.size()) # need to check
+    # then add the noise
+    dx_noise = dx_clip + torch.normal(mean = 0, std = clip* noise, size = dx.size()).to(device)
+    return dx_noise, norm.cpu()
 
-    return dx_noise, norm
+
+def fedavg_dw(dw):
+    num_client = len(dw)
+    l = len(dw[0][0])
+    dw_avg = []
+    for idx in range(l):
+        dw_list = [dw[i][idx].cpu().detach() for i in range(num_client)]
+        avg = torch.mean(torch.stack(dw_list))
+        dw_avg.append(avg)
+    return dw_avg
+
+def categorical_values_to_int(df, columns,given_dicts):
+    # san check
+    assert set(df.columns).issuperset(columns)
+
+    def fn(col):
+        cat = dict([(o, i) for i, o in enumerate(set(df[col]))])
+        for d in given_dicts:
+            if set(d.keys()) == set(cat.keys()):
+                cat = d
+                break
+        df[col] = df[col].apply(lambda x: cat[x])
+        return cat
+
+    return df, [fn(c) for c in columns]
+
+
+def load_banking():
+    bank_path = '/datasets/bank/bank_full.csv'
+    bank_df = pd.read_csv(bank_path,sep=";")
+    bank_df['pdays'] = bank_df['pdays'].apply(lambda x: 999 if x == -1 else x)
+    cat_cols = ['job', 'marital', 'education', 'default', 'housing', 'loan', 'contact', 'month', 'poutcome', 'y']
+    dicts = categorical_values_to_int(bank_df, columns=cat_cols, given_dicts=[{'no': 0, 'yes': 1}])[1]
+    col_mappings = dict(zip(cat_cols, dicts))
+    for col in ['age', 'balance', 'campaign', 'previous', 'pdays']:
+        arr = bank_df[col].values
+        min_arr, max_arr = arr.min(), arr.max()
+        bank_df[col] = (arr - arr.min()) / (arr.max() - arr.min())
+        col_mappings[col] = (arr.min(), arr.max())
+
+    client_features = ['marital', 'job', 'education', 'housing','loan','contact']
+    dense_features = ['balance','age']
+    sparse_features = ['day','month','duration','campaign','pdays','previous','poutcome']
+    target = ['y']
+
+
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    feature_names = get_feature_names(linear_feature_columns + dnn_feature_columns, )
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    client_feature_names = get_feature_names(client_feature_columns, )
+
+    train, test = train_test_split(bank_df, test_size=0.1, random_state = 42)
+    train_model_input = {name:train[name] for name in feature_names}
+    test_model_input = {name:test[name] for name in feature_names}
+    train_client_input = {name:train[name] for name in client_feature_names}
+    test_client_input = {name:test[name] for name in client_feature_names}
+
+    return train_model_input,  train_client_input, train[target].values, test_model_input, test_client_input,test[target].values
+
+def get_banking_columns():
+    sparse_features = ['day','month','duration','campaign','pdays','previous','poutcome']  
+    dense_features = ['balance','age']
+    client_features = ['marital', 'job', 'education', 'housing','loan','contact']
+
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]# + [VarLenSparseFeat(SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8), 1) for feat in sequence_features] 
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    return linear_feature_columns, dnn_feature_columns, client_feature_columns
+
+
+def load_adult(client_features, sparse_features, dense_features):
+    #adult = '/datasets/adult/adult.csv'
+    adult = 'adult.csv'
+    df = pd.read_csv(adult,sep=",")
+    for col in df.columns:
+        if "?" in df[col].unique().tolist():
+            df[col] = df[col].apply(lambda x: 'unknown' if x == '?' else x)
+        
+    cat_cols = ['workclass', 'educational-num', 'marital-status', 'occupation',
+        'relationship', 'race', 'gender', 'native-country']
+    num_cols = ['age', 'capital-gain', 'capital-loss', 'hours-per-week']
+    label_col = ['income']
+    df.reset_index(drop=True, inplace=True)
+    ids = ['N%05d' % i for i in range(len(df))]
+    df.insert(0, 'ID', ids)
+    df = df.loc[:, ['ID'] + cat_cols + num_cols + label_col]
+    df.set_index('ID', inplace=True)
+    for col in cat_cols + label_col:
+        lst = sorted(df[col].unique().tolist())
+        mapping = dict(zip(lst, range(len(lst))))
+        df[col] = df[col].apply(lambda x: mapping[x])
+    for col in num_cols:
+        arr = df[col].values
+        df[col] = (arr - arr.min()) / (arr.max() - arr.min())
+    df = df.rename(columns={"educational-num": "education", 
+                            "marital-status": "marital", 
+                            "native-country":"country", 
+                            "capital-gain": "gain", 
+                            "capital-loss": "loss", 
+                            "hours-per-week":"hours_per_week"})
+
+    # prepare the column for offsite features and model
+    #client_features = ['gender', 'race', 'relationship', 'marital']
+    # dense_features = ['age','gain', 'loss', 'hours_per_week']
+    #sparse_features = ['workclass','education','occupation','country']
+    # client_features = ['gender','race','marital','relationship','occupation']
+    # sparse_features = ['country','workclass','education']
+    target = ['income']
+    
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    feature_names = get_feature_names(linear_feature_columns + dnn_feature_columns, )
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    client_feature_names = get_feature_names(client_feature_columns, )
+
+    train, test = train_test_split(df, test_size=0.1, random_state = 2)
+    train_model_input = {name:train[name] for name in feature_names}
+    test_model_input = {name:test[name] for name in feature_names}
+    train_client_input = {name:train[name] for name in client_feature_names}
+    test_client_input = {name:test[name] for name in client_feature_names}
+
+    return train_model_input,  train_client_input, train[target].values, test_model_input, test_client_input,test[target].values
+
+def get_adult_columns(client_features, sparse_features, dense_features):
+    #client_features = ['gender', 'race', 'relationship', 'marital']
+    # client_features = ['gender','race','marital','relationship','occupation']
+    # sparse_features = ['country','workclass','education']
+    # dense_features = ['age','gain', 'loss', 'hours_per_week']
+    #sparse_features = ['workclass','education','occupation','country'] 
+
+    fixlen_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in sparse_features] + [DenseFeat(feat, 1, )for feat in dense_features]# + [VarLenSparseFeat(SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8), 1) for feat in sequence_features] 
+    linear_feature_columns = fixlen_feature_columns
+    dnn_feature_columns = fixlen_feature_columns
+    client_feature_columns = [SparseFeat(feat, vocabulary_size=2000000,embedding_dim=8) for feat in client_features]
+    return linear_feature_columns, dnn_feature_columns, client_feature_columns
