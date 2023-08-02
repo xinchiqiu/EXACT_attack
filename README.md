@@ -1,2 +1,5 @@
-# meta_fsl_attack
+# Attack for the vFedSec
+
 For the attack project of FSL
+
+model DeepFM used from the github: https://github.com/shenweichen/DeepCTR-Torch
